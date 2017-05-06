@@ -1,4 +1,4 @@
-package network
+package retention
 
 import "sync"
 
@@ -38,6 +38,11 @@ func (s *StringIDs) GetID(input string) uint64 {
 func (s *StringIDs) Get(id uint64) string {
 	// TODO I think we can get away without locking here - confirm
 	return s.strings[id]
+}
+
+func (s *StringIDs) Last() (curID uint64) {
+	curID = s.cur
+	return
 }
 
 type Nexter struct {

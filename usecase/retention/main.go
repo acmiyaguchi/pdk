@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,19 +15,30 @@ import (
 
 	_ "net/http/pprof"
 
+	"github.com/acmiyaguchi/pdk"
 	pcli "github.com/pilosa/go-pilosa"
-	"github.com/pilosa/pdk"
 	"github.com/pilosa/pilosa"
 )
 
-/***********************
-use case implementation
-***********************/
-
-// TODO autoscan 1. determine field type by attempting conversions
-// TODO autoscan 2. determine field mapping by looking at statistics (for floatmapper, intmapper)
-// TODO autoscan 3. write results from ^^ to config file
-// TODO read ParserMapper config from file (cant do CustomMapper)
+var Frames = []string{
+	"channel",
+	"country",
+	"os",
+	"days_since_profile_creation",
+	/*
+		"subsession_length",
+		"distribution_id",
+		"submission_date",
+		"sync_configured",
+		"app_version",
+		"locale",
+		"active_addons_count",
+		"is_default_browser",
+		"default_search_engine",
+		"unique_domains_count",
+		"total_uri_count"
+	*/
+}
 
 type Main struct {
 	PilosaHost  string
@@ -38,17 +50,10 @@ type Main struct {
 	importer pdk.PilosaImporter
 	urls     []string
 
+	clientIDs    *StringIDs
+	frameIDs     map[string]int
+	frameMapper  map[string]*StringIDs
 	recordMapper []pdk.BitMapper
-
-	channelIDs             *StringIDs
-	countryIDs             *StringIDs
-	osIDs                  *StringIDs
-	distributionIDs        *StringIDs
-	appVersionIDs          *StringIDs
-	localeIDs              *StringIDs
-	defaultSearchEngineIDs *StringIDs
-
-	nexter *Nexter
 
 	totalBytes int64
 	bytesLock  sync.Mutex
@@ -60,20 +65,27 @@ type Main struct {
 func NewMain() *Main {
 	m := &Main{
 		Concurrency: 1,
-		nexter:      &Nexter{},
 		urls:        make([]string, 0),
 
 		totalRecs:   &Counter{},
 		skippedRecs: &Counter{},
 
-		channelIDs: NewStringIDs(),
-		countryIDs: NewStringIDs(),
-		osIDs:      NewStringIDs(),
-		// distributionIDs:        NewStringIDs(),
-		// appVersionIDs:          NewStringIDs(),
-		// localeIDs:              NewStringIDs(),
-		// defaultSearchEngineIDs: NewStringIDs(),
+		clientIDs:    NewStringIDs(),
+		frameIDs:     make(map[string]int),
+		frameMapper:  make(map[string]*StringIDs),
+		recordMapper: make([]pdk.BitMapper, 0),
 	}
+
+	// The first two fields are reserved for (client_id, timestamp)
+	var field_offset = 2
+
+	// Initialize the frame->id and frame->(label->id) mappings
+	for i, frame := range Frames {
+		m.frameIDs[frame] = i + field_offset
+		m.frameMapper[frame] = NewStringIDs()
+	}
+
+	m.recordMapper = getBitMappers(m)
 
 	return m
 }
@@ -88,27 +100,7 @@ func (m *Main) Run() error {
 		return err
 	}
 
-	frames := []string{
-		"channel",
-		"country",
-		"os",
-		"profile_creation_date",
-		"subsession_start_date",
-		/*
-			"subsession_length",
-			"distribution_id",
-			"submission_date",
-			"sync_configured",
-			"app_version",
-			"locale",
-			"active_addons_count",
-			"is_default_browser",
-			"default_search_engine",
-			"unique_domains_count",
-			"total_uri_count" */
-	}
-
-	m.importer = pdk.NewImportClient(m.PilosaHost, m.Index, frames, m.BufferSize)
+	m.importer = pdk.NewImportClient(m.PilosaHost, m.Index, Frames, m.BufferSize)
 
 	pilosaURI, err := pcli.NewURIFromAddress(m.PilosaHost)
 	if err != nil {
@@ -123,7 +115,7 @@ func (m *Main) Run() error {
 	if err != nil {
 		return fmt.Errorf("ensuring index existence: %v", err)
 	}
-	for _, frame := range frames {
+	for _, frame := range Frames {
 		fram, err := index.Frame(frame, &pcli.FrameOptions{CacheType: pilosa.CacheTypeRanked})
 		if err != nil {
 			return fmt.Errorf("making frame: %v", err)
@@ -146,15 +138,12 @@ func (m *Main) Run() error {
 		close(urls)
 	}()
 
-	m.greenBms = getBitMappers(greenFields)
-	m.yellowBms = getBitMappers(yellowFields)
-	m.ams = getAttrMappers()
-
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		for range c {
-			log.Printf("Profiles: %d, Bytes: %s", m.nexter.Last(), pdk.Bytes(m.BytesProcessed()))
+			log.Printf("Profiles: %d, Bytes: %s",
+				m.clientIDs.Last(), pdk.Bytes(m.BytesProcessed()))
 			os.Exit(0)
 		}
 	}()
@@ -209,7 +198,7 @@ func (m *Main) printStats() *time.Ticker {
 			duration := time.Since(start)
 			bytes := m.BytesProcessed()
 			log.Printf("Profiles: %d, Bytes: %s, Records: %v, Duration: %v, Rate: %v/s",
-				m.nexter.Last(), pdk.Bytes(bytes), m.totalRecs.Get(),
+				m.clientIDs.Last(), pdk.Bytes(bytes), m.totalRecs.Get(),
 				duration, pdk.Bytes(float64(bytes)/duration.Seconds()))
 			log.Printf("Skipped: %v", m.skippedRecs.Get())
 		}
@@ -293,9 +282,16 @@ Records:
 			continue
 		}
 
-		var bms []pdk.BitMapper
-		bitsToSet := make([]BitFrame, 0)
+		client_id := m.clientIDs.GetID(fields[0])
 
+		layout := "2006-01-02"
+		timestamp, err := time.Parse(layout, fields[1])
+		if err != nil {
+			// TODO: Set a default date
+		}
+
+		bitsToSet := make([]BitFrame, 0)
+		var bms = m.recordMapper
 		for _, bm := range bms {
 			if len(bm.Fields) != len(bm.Parsers) {
 				// TODO if len(pm.Parsers) == 1, use that for all fields
@@ -336,39 +332,52 @@ Records:
 				bitsToSet = append(bitsToSet, BitFrame{Bit: uint64(id), Frame: bm.Frame})
 			}
 		}
-		profileID := m.nexter.Next()
+
 		for _, bit := range bitsToSet {
-			m.importer.SetBit(bit.Bit, profileID, bit.Frame)
+			m.importer.SetBitTimestamp(bit.Bit, client_id, bit.Frame, timestamp)
 		}
 	}
 }
 
-func getBitMappers(fields map[string]int) []pdk.BitMapper {
-	tp := pdk.TimeParser{Layout: "2006-01-02 15:04:05"}
+func getBitMappers(m *Main) []pdk.BitMapper {
+	// The custom function maps categorical labels for a field to an
+	// uint64 id that is stored in memory. This id is then mapped to
+	// the bitmap by the predifined IntMapper.
+	// (string -> int64) -> int64
+	idMapper := func(field string) pdk.CustomMapper {
+		return pdk.CustomMapper{
+			// Get the id for the field
+			Func: func(fields ...interface{}) interface{} {
+				return m.frameMapper[field].GetID(fields[0].(string))
+			},
+			Mapper: pdk.IntMapper{
+				Min: math.MinInt64,
+				Max: math.MaxInt64,
+				// NOTE: BitDepth is not defined
+			},
+		}
+	}
 
-	// TODO: Define a custom mapper for categorical attributes. This takes advantage of the StringIDs mapper. This should
-	// first generate an integer id, and then apply the IntMapper on top of this
-
-	// TODO: Create an array of mappers that correspond to each column in the csv file.
-	// 	"channel",
-	//	"country",
-	//	"os",
-	//	"profile_creation_date",
-	//	"subsession_start_date",
-	// The above colums are the attributes that will be focused on in the first iteration.
+	// Generate a categorical bitmapper by applying the idMapper to
+	// each categorical field in the incoming dataset
+	categoricalBitMapper := func(field string) pdk.BitMapper {
+		return pdk.BitMapper{
+			Frame:   field,
+			Mapper:  idMapper(field),
+			Parsers: []pdk.Parser{pdk.StringParser{}},
+			Fields:  []int{m.frameIDs[field]},
+		}
+	}
 
 	recordMapper := []pdk.BitMapper{
+		categoricalBitMapper("channel"),
+		categoricalBitMapper("country"),
+		categoricalBitMapper("os"),
 		pdk.BitMapper{
-			Frame:   "passenger_count",
-			Mapper:  pdk.IntMapper{Min: 0, Max: 9},
+			Frame:   "days_since_profile_creation",
+			Mapper:  pdk.IntMapper{Min: -1, Max: math.MaxInt64},
 			Parsers: []pdk.Parser{pdk.IntParser{}},
-			Fields:  []int{fields["passenger_count"]},
-		},
-		pdk.BitMapper{
-			Frame:   "pickup_day",
-			Mapper:  pdk.DayOfWeekMapper{},
-			Parsers: []pdk.Parser{tp},
-			Fields:  []int{fields["pickup_datetime"]},
+			Fields:  []int{m.frameIDs["days_since_profile_creation"]},
 		},
 	}
 
@@ -403,27 +412,5 @@ func (c *Counter) Get() (ret int64) {
 	c.lock.Lock()
 	ret = c.num
 	c.lock.Unlock()
-	return
-}
-
-// Nexter generates unique bitmapIDs
-type Nexter struct {
-	id   uint64
-	lock sync.Mutex
-}
-
-// Next generates a new bitmapID
-func (n *Nexter) Next() (nextID uint64) {
-	n.lock.Lock()
-	nextID = n.id
-	n.id++
-	n.lock.Unlock()
-	return
-}
-
-func (n *Nexter) Last() (lastID uint64) {
-	n.lock.Lock()
-	lastID = n.id - 1
-	n.lock.Unlock()
 	return
 }
