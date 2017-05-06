@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/acmiyaguchi/pdk/usecase/retention"
+	"github.com/pilosa/pdk/usecase/retention"
 	"github.com/spf13/cobra"
 )
 
@@ -33,6 +33,7 @@ func NewRetentionCommand(stdin io.Reader, stdout, stderr io.Writer) *cobra.Comma
 	flags.StringVarP(&RetentionMain.PilosaHost, "pilosa", "p", "localhost:10101", "Pilosa host")
 	flags.StringVarP(&RetentionMain.Index, "index", "i", "retention", "Pilosa db to write to")
 	flags.StringVarP(&RetentionMain.URLFile, "url-file", "f", "usecase/retention/urls.txt", "File to get raw data urls from. Urls may be http or local files.")
+	flags.StringVarP(&Net.BindAddr, "bind-addr", "a", "localhost:10102", "Address which mapping proxy will bind to")
 
 	return retentionCommand
 }

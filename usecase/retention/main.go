@@ -15,8 +15,8 @@ import (
 
 	_ "net/http/pprof"
 
-	"github.com/acmiyaguchi/pdk"
 	pcli "github.com/pilosa/go-pilosa"
+	"github.com/pilosa/pdk"
 	"github.com/pilosa/pilosa"
 )
 
@@ -46,6 +46,7 @@ type Main struct {
 	Concurrency int
 	Index       string
 	BufferSize  int
+	BindAddr    string
 
 	importer pdk.PilosaImporter
 	urls     []string
@@ -67,13 +68,13 @@ func NewMain() *Main {
 		Concurrency: 1,
 		urls:        make([]string, 0),
 
-		totalRecs:   &Counter{},
-		skippedRecs: &Counter{},
-
 		clientIDs:    NewStringIDs(),
 		frameIDs:     make(map[string]int),
 		frameMapper:  make(map[string]*StringIDs),
 		recordMapper: make([]pdk.BitMapper, 0),
+
+		totalRecs:   &Counter{},
+		skippedRecs: &Counter{},
 	}
 
 	// The first two fields are reserved for (client_id, timestamp)
@@ -125,6 +126,10 @@ func (m *Main) Run() error {
 			return fmt.Errorf("creating frame '%v': %v", frame, err)
 		}
 	}
+
+	go func() {
+		log.Fatal(pdk.StartMappingProxy(m.BindAddr, "http://"+m.PilosaHost, m))
+	}()
 
 	ticker := m.printStats()
 
@@ -209,6 +214,7 @@ func (m *Main) printStats() *time.Ticker {
 func (m *Main) fetch(urls <-chan string, records chan<- Record) {
 	for url := range urls {
 		var content io.ReadCloser
+		log.Printf("Reading csv from %s", url)
 		if strings.HasPrefix(url, "http") {
 			resp, err := http.Get(url)
 			if err != nil {
@@ -227,26 +233,13 @@ func (m *Main) fetch(urls <-chan string, records chan<- Record) {
 
 		scan := bufio.NewScanner(content)
 		// discard header line
-		correctLine := false
 		if scan.Scan() {
-			header := scan.Text()
-			if strings.HasPrefix(header, "client_id") {
-				correctLine = true
-			}
+			scan.Text()
 		}
 		for scan.Scan() {
 			m.totalRecs.Add(1)
 			record := scan.Text()
 			m.AddBytes(len(record))
-			if correctLine {
-				// last field needs to be shifted over by 1
-				lastcomma := strings.LastIndex(record, ",")
-				if lastcomma == -1 {
-					m.skippedRecs.Add(1)
-					continue
-				}
-				record = record[:lastcomma] + "," + record[lastcomma:]
-			}
 			records <- Record{Val: record}
 		}
 		err := content.Close()
@@ -286,9 +279,7 @@ Records:
 
 		layout := "2006-01-02"
 		timestamp, err := time.Parse(layout, fields[1])
-		if err != nil {
-			// TODO: Set a default date
-		}
+		if err != nil {} // TODO: error handling
 
 		bitsToSet := make([]BitFrame, 0)
 		var bms = m.recordMapper
@@ -348,7 +339,7 @@ func getBitMappers(m *Main) []pdk.BitMapper {
 		return pdk.CustomMapper{
 			// Get the id for the field
 			Func: func(fields ...interface{}) interface{} {
-				return m.frameMapper[field].GetID(fields[0].(string))
+				return int64(m.frameMapper[field].GetID(fields[0].(string)))
 			},
 			Mapper: pdk.IntMapper{
 				Min: math.MinInt64,
@@ -382,6 +373,32 @@ func getBitMappers(m *Main) []pdk.BitMapper {
 	}
 
 	return recordMapper
+}
+
+func (m *Main) Get(frame string, id uint64) interface{} {
+	return m.frameMapper[frame].Get(id)
+}
+
+func (m *Main) GetID(frame string, ival interface{}) (uint64, error) {
+	val, isString := ival.(string)
+	checkStr := func(mapper func(string) uint64) (uint64, error) {
+		if isString {
+			return mapper(val), nil
+		}
+		return 0, fmt.Errorf("%v is not a string, but should be for frame %s", ival, frame)
+	}
+
+	// TODO: mapping from (int -> int)
+	switch frame {
+	case "days_since_profile_creation":
+		fval, ok := ival.(float64)
+		if !ok {
+			return 0, fmt.Errorf("%v should be numeric for frame %s", ival, frame)
+		}
+		return uint64(fval), nil
+	default:
+		return checkStr(m.frameMapper[frame].GetID)
+	}
 }
 
 func (m *Main) AddBytes(n int) {
